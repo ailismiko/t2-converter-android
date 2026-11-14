@@ -1,4 +1,4 @@
-name: Build T2 Video Converter APK
+name: Build T2 Video Converter v2.0 APK
 on:
   push:
     branches: [ "main", "master" ]
@@ -21,5 +21,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: T2VideoConverter-debug-apk
+          name: T2VideoConverter-v2.0-debug-apk
           path: app/build/outputs/apk/debug/*.apk
