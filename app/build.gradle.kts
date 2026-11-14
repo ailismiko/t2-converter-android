@@ -42,4 +42,5 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
+    implementation("com.arthenica:smart-exception-java:0.2.1")
 }

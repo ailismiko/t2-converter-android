@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -17,7 +18,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFprobeKit
 import com.arthenica.ffmpegkit.ReturnCode
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -29,6 +32,7 @@ data class VideoTask(
     val displayName: String,
     val outputName: String,
     val status: String = "等待转换",
+    val isFailed: Boolean = false,
     val progress: Float = 0f
 )
 
@@ -54,14 +58,50 @@ class MainActivity : ComponentActivity() {
         val picker = rememberLauncherForActivityResult(
             ActivityResultContracts.OpenMultipleDocuments()
         ) { uris ->
+            if (uris.isEmpty()) return@rememberLauncherForActivityResult
             val start = startEp.toIntOrNull()?.coerceAtLeast(1) ?: 1
-            tasks = uris.mapIndexed { idx, uri ->
-                val ep = (start + idx).toString().padStart(2, '0')
+            val named = uris.map { uri -> uri to resolveDisplayName(uri) }
+                .sortedWith { a, b -> naturalCompare(a.second, b.second) }
+            val padWidth = maxOf(2, (start + named.size - 1).toString().length)
+            tasks = named.mapIndexed { idx, (uri, fileName) ->
+                val ep = (start + idx).toString().padStart(padWidth, '0')
                 VideoTask(
                     uri = uri,
-                    displayName = uri.lastPathSegment ?: "video_$ep",
+                    displayName = fileName,
                     outputName = "${seriesName.ifBlank { "梦想妄想世界" }}_${ep}.mp4"
                 )
+            }
+        }
+
+        fun runTaskAt(idx: Int, onDone: () -> Unit) {
+            scope.launch {
+                val current = tasks.getOrNull(idx) ?: run {
+                    onDone()
+                    return@launch
+                }
+                tasks = tasks.toMutableList().also {
+                    it[idx] = current.copy(status = "转换中 0%", isFailed = false, progress = 0f)
+                }
+                val (ok, msg) = convertSingleUri(current.uri, current.outputName) { pct ->
+                    tasks = tasks.toMutableList().also { list ->
+                        if (idx < list.size) {
+                            list[idx] = list[idx].copy(
+                                status = "转换中 ${(pct * 100).toInt()}%",
+                                progress = pct
+                            )
+                        }
+                    }
+                }
+                tasks = tasks.toMutableList().also { list ->
+                    if (idx < list.size) {
+                        list[idx] = list[idx].copy(
+                            status = if (ok) "已完成 · Movies/T2Output" else "失败: $msg",
+                            isFailed = !ok,
+                            progress = if (ok) 1f else 0f
+                        )
+                    }
+                }
+                onDone()
             }
         }
 
@@ -81,12 +121,14 @@ class MainActivity : ComponentActivity() {
                         value = seriesName,
                         onValueChange = { seriesName = it },
                         label = { Text("剧集名称") },
+                        singleLine = true,
                         modifier = Modifier.weight(2f)
                     )
                     OutlinedTextField(
                         value = startEp,
                         onValueChange = { startEp = it },
                         label = { Text("起始集") },
+                        singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -100,17 +142,10 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             isRunning = true
                             scope.launch {
-                                tasks.forEachIndexed { idx, task ->
-                                    tasks = tasks.toMutableList().also {
-                                        it[idx] = task.copy(status = "转换中...")
-                                    }
-                                    val result = convertSingleUri(task.uri, task.outputName)
-                                    tasks = tasks.toMutableList().also {
-                                        it[idx] = task.copy(
-                                            status = if (result) "已保存至 Movies/T2Output" else "转换失败",
-                                            progress = if (result) 1f else 0f
-                                        )
-                                    }
+                                for (idx in tasks.indices) {
+                                    val done = CompletableDeferred<Unit>()
+                                    runTaskAt(idx) { done.complete(Unit) }
+                                    done.await()
                                 }
                                 isRunning = false
                             }
@@ -121,11 +156,32 @@ class MainActivity : ComponentActivity() {
                 }
 
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    itemsIndexed(tasks) { _, item ->
+                    itemsIndexed(tasks) { idx, item ->
                         Card(modifier = Modifier.fillMaxWidth()) {
-                            Column(modifier = Modifier.padding(12.dp)) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
                                 Text(item.outputName, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "原文件: ${item.displayName}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
                                 Text(item.status, style = MaterialTheme.typography.bodySmall)
+                                if (item.progress > 0f && item.progress < 1f) {
+                                    LinearProgressIndicator(
+                                        progress = { item.progress },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                                if (item.isFailed && !isRunning) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            isRunning = true
+                                            runTaskAt(idx) { isRunning = false }
+                                        }
+                                    ) { Text("单独重试") }
+                                }
                             }
                         }
                     }
@@ -134,14 +190,43 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun convertSingleUri(uri: Uri, outputName: String): Boolean = withContext(Dispatchers.IO) {
+    private fun resolveDisplayName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) return c.getString(idx) ?: "video"
+            }
+        }
+        return uri.lastPathSegment ?: "video"
+    }
+
+    private fun naturalCompare(a: String, b: String): Int {
+        val re = Regex("(\\d+|\\D+)")
+        val pa = re.findAll(a).map { it.value }.toList()
+        val pb = re.findAll(b).map { it.value }.toList()
+        for (i in 0 until minOf(pa.size, pb.size)) {
+            val x = pa[i]
+            val y = pb[i]
+            val nx = x.toLongOrNull()
+            val ny = y.toLongOrNull()
+            val cmp = if (nx != null && ny != null) nx.compareTo(ny) else x.compareTo(y, ignoreCase = true)
+            if (cmp != 0) return cmp
+        }
+        return pa.size.compareTo(pb.size)
+    }
+
+    private suspend fun convertSingleUri(
+        uri: Uri,
+        outputName: String,
+        onProgress: (Float) -> Unit
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         val rawTmp = File(cacheDir, "in_${System.currentTimeMillis()}.tmp")
         val cleanTmp = File(cacheDir, "clean_${System.currentTimeMillis()}.mp4")
         val outTmp = File(cacheDir, outputName)
         try {
             contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(rawTmp).use { output -> input.copyTo(output) }
-            } ?: return@withContext false
+            } ?: return@withContext false to "无法读取文件"
 
             // 自动剥离 B 站 .m4s 头部 000000000 混淆字节
             val head = ByteArray(64)
@@ -152,9 +237,18 @@ class MainActivity : ComponentActivity() {
             } else 0L
 
             rawTmp.inputStream().use { inp ->
-                inp.skip(skipBytes)
+                var skipped = 0L
+                while (skipped < skipBytes) {
+                    val n = inp.skip(skipBytes - skipped)
+                    if (n <= 0) break
+                    skipped += n
+                }
                 FileOutputStream(cleanTmp).use { out -> inp.copyTo(out) }
             }
+
+            val mediaInfo = FFprobeKit.getMediaInformation(cleanTmp.absolutePath).mediaInformation
+            val srcDurationSec = mediaInfo?.duration?.toDoubleOrNull() ?: 0.0
+            val targetDurationMs = (minOf(if (srcDurationSec > 0) srcDurationSec else 60.0, 1440.0) * 1000.0)
 
             val cmd = listOf(
                 "-y", "-i", cleanTmp.absolutePath,
@@ -165,9 +259,29 @@ class MainActivity : ComponentActivity() {
                 outTmp.absolutePath
             ).joinToString(" ") { if (it.contains(" ")) "\"$it\"" else it }
 
-            val session = FFmpegKit.execute(cmd)
-            if (!ReturnCode.isSuccess(session.returnCode) || !outTmp.exists()) {
-                return@withContext false
+            val finished = CompletableDeferred<Boolean>()
+            var failDetail = ""
+            FFmpegKit.executeAsync(
+                cmd,
+                { session ->
+                    val ok = ReturnCode.isSuccess(session.returnCode) && outTmp.exists()
+                    if (!ok) {
+                        failDetail = session.failStackTrace ?: session.allLogsAsString.takeLast(200)
+                    }
+                    finished.complete(ok)
+                },
+                { },
+                { stats ->
+                    if (targetDurationMs > 0) {
+                        val pct = (stats.time.toDouble() / targetDurationMs).toFloat().coerceIn(0f, 0.99f)
+                        onProgress(pct)
+                    }
+                }
+            )
+
+            val ok = finished.await()
+            if (!ok) {
+                return@withContext false to failDetail.ifBlank { "FFmpeg 转码失败" }
             }
 
             val values = ContentValues().apply {
@@ -176,13 +290,13 @@ class MainActivity : ComponentActivity() {
                 put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/T2Output")
             }
             val outUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return@withContext false
+                ?: return@withContext false to "写入系统 Movies 目录失败"
             contentResolver.openOutputStream(outUri)?.use { outStream ->
                 outTmp.inputStream().use { it.copyTo(outStream) }
             }
-            true
-        } catch (_: Exception) {
-            false
+            true to "OK"
+        } catch (e: Throwable) {
+            false to (e.message ?: e.javaClass.simpleName)
         } finally {
             rawTmp.delete()
             cleanTmp.delete()
